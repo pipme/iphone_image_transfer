@@ -88,6 +88,12 @@ identified from ~768 KB, not 125 MB. This is reliable for photos/videos (they
 differ throughout). Add `--full` to hash entire files for exact byte-for-byte
 certainty (much slower on large libraries).
 
+Reads run in parallel (`--workers`, default 8), which matters a lot on external
+USB disks where each file access is mostly I/O *wait* — on a spinning USB drive
+this was ~5× faster than single-threaded. Use `--workers 1` to disable. Tip: run
+dedup **after** the backup finishes, not alongside it — sharing one USB disk
+between reads and writes slows both to a crawl.
+
 ---
 
 ## Troubleshooting

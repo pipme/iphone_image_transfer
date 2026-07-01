@@ -31,6 +31,7 @@ import shutil
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 _SUFFIX_RE = re.compile(r" \d+$")            # trailing " 1", " 12", ...
 _SAMPLE = 256 * 1024                          # bytes sampled per region (head/mid/tail)
@@ -158,14 +159,14 @@ def _emit(members, size, groups):
         groups.append((k, [p for p in members if p != k], size))
 
 
-def find_duplicates(folder, full=False):
+def find_duplicates(folder, full=False, workers=8):
     """Return list of (keep_path, [dup_paths]) for identical-content groups.
 
     Files are first bucketed by size (free, from stat), so only files that share
-    a size are ever read. Then, to minimise seeks on spinning disks, large files
-    are prefiltered by a single sequential read of their HEAD; only files whose
-    head (and size) already match pay for the extra middle/tail seeks. Small
-    files (and --full) are hashed whole in one read.
+    a size are ever read. Small files (and --full) are hashed whole; large files
+    are prefiltered by their HEAD and only head+size matches pay for the extra
+    middle/tail reads. Reads run on a thread pool because the per-file cost on
+    external USB disks is mostly I/O *wait*, which overlaps well across threads.
     """
     by_size = gather(folder)
     candidates = {s: ps for s, ps in by_size.items() if len(ps) > 1}
@@ -179,54 +180,73 @@ def find_duplicates(folder, full=False):
     unique = all_files - total_files
     print(f"Scanned {all_files} files: {unique} have a unique size (skipped "
           f"without reading); {total_files} share a size and get checked "
-          f"({human(total_bytes)} max to read, {'full hash' if full else 'sampled'}).")
+          f"({human(total_bytes)} max to read, {'full hash' if full else 'sampled'}, "
+          f"{workers} threads).")
 
     bar = make_bar(total_bytes, "  Hashing")
     groups = []
-    for size, paths in candidates.items():
-        if full or size <= _SAMPLE * 3:
-            # One sequential read of the whole (small) file — exact.
-            buckets = defaultdict(list)
-            for p in paths:
-                try:
-                    digest, read = full_hash(p)
-                except OSError as e:
-                    bar.write(f"  skipped {p}: {e}")
-                    bar.update(to_read(size))
-                    continue
-                buckets[digest].append(p)
-                bar.update(read)
-            for members in buckets.values():
-                _emit(members, size, groups)
-            continue
 
-        # Large files: prefilter by head (1 seek), confirm with mid+tail.
-        head = defaultdict(list)
-        for p in paths:
-            try:
-                digest, read = head_hash(p)
-            except OSError as e:
-                bar.write(f"  skipped {p}: {e}")
-                bar.update(to_read(size))
-                continue
-            head[digest].append(p)
-            bar.update(read)
-        for hpaths in head.values():
-            if len(hpaths) < 2:
-                bar.update(_SAMPLE * 2 * len(hpaths))   # skipped mid+tail reads
-                continue
-            confirmed = defaultdict(list)
-            for p in hpaths:
-                try:
-                    digest, read = midtail_hash(p, size)
-                except OSError as e:
-                    bar.write(f"  skipped {p}: {e}")
-                    bar.update(_SAMPLE * 2)
-                    continue
-                confirmed[digest].append(p)
-                bar.update(read)
-            for members in confirmed.values():
-                _emit(members, size, groups)
+    def run(fn, items):
+        """Stream fn over items on the pool (or serially if workers<=1),
+        yielding results in order and shutting the pool down when done."""
+        if workers <= 1:
+            yield from map(fn, items)
+            return
+        ex = ThreadPoolExecutor(max_workers=workers)
+        try:
+            yield from ex.map(fn, items)
+        finally:
+            ex.shutdown(wait=False)
+
+    # Phase 1: hash each candidate's head (large) or whole file (small/--full).
+    def phase1(item):
+        size, p = item
+        try:
+            if full or size <= _SAMPLE * 3:
+                digest, read = full_hash(p)
+                return (size, p, ("F", digest), read, None)
+            digest, read = head_hash(p)
+            return (size, p, ("H", digest), read, None)
+        except OSError as e:
+            return (size, p, None, to_read(size), e)
+
+    items = [(size, p) for size, paths in candidates.items() for p in paths]
+    first = defaultdict(list)
+    for size, p, key, read, err in run(phase1, items):
+        bar.update(read)
+        if err:
+            bar.write(f"  skipped {p}: {err}")
+            continue
+        first[(size, key)].append(p)
+
+    # Small/--full buckets are already final; large 'head' buckets need confirming.
+    confirm = []                                   # (size, head_digest, path)
+    for (size, (kind, digest)), members in first.items():
+        if kind == "F":
+            _emit(members, size, groups)
+        elif len(members) < 2:
+            bar.update(_SAMPLE * 2 * len(members))  # mid+tail we won't read
+        else:
+            confirm += [(size, digest, p) for p in members]
+
+    # Phase 2: confirm same-head large files by their middle+tail.
+    def phase2(item):
+        size, hdig, p = item
+        try:
+            digest, read = midtail_hash(p, size)
+            return (size, hdig, p, digest, read, None)
+        except OSError as e:
+            return (size, hdig, p, None, _SAMPLE * 2, e)
+
+    second = defaultdict(list)                      # (size, head_dig, midtail_dig)
+    for size, hdig, p, digest, read, err in run(phase2, confirm):
+        bar.update(read)
+        if err:
+            bar.write(f"  skipped {p}: {err}")
+            continue
+        second[(size, hdig, digest)].append(p)
+    for (size, _, _), members in second.items():
+        _emit(members, size, groups)
     bar.close()
     return groups
 
@@ -243,6 +263,9 @@ def main():
     ap.add_argument("--full", action="store_true",
                     help="Hash whole files instead of head/middle/tail samples "
                          "(slower, exact byte-for-byte certainty).")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="Parallel read threads (default 8; helps on high-latency "
+                         "external/USB disks; use 1 to disable).")
     args = ap.parse_args()
 
     folder = os.path.abspath(args.folder)
@@ -250,7 +273,7 @@ def main():
         sys.exit(f"Not a folder: {folder}")
     trash = os.path.abspath(args.trash) if args.trash else os.path.join(folder, "_duplicates")
 
-    groups = find_duplicates(folder, full=args.full)
+    groups = find_duplicates(folder, full=args.full, workers=args.workers)
     dup_count = sum(len(d) for _, d, _ in groups)
     freed = sum(size * len(d) for _, d, size in groups)
     print(f"\nFound {len(groups)} duplicate group(s): "
