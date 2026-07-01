@@ -30,7 +30,7 @@ import time
 from collections import defaultdict
 
 _SUFFIX_RE = re.compile(r" \d+$")            # trailing " 1", " 12", ...
-_QUICK_BYTES = 65536                          # prefilter read size
+_SAMPLE = 256 * 1024                          # bytes sampled per region (head/mid/tail)
 
 
 def human(n):
@@ -81,20 +81,41 @@ def make_bar(total, desc):
         return _SimpleBar(total, desc)
 
 
-def file_hash(path, limit=None, bar=None):
-    """SHA-1 of a file (or its first `limit` bytes)."""
+def full_hash(path):
+    """SHA-1 of the entire file; returns (digest, bytes_read)."""
     h = hashlib.sha1()
-    remaining = limit if limit is not None else float("inf")
-    with open(path, "rb") as f:
-        while remaining > 0:
-            chunk = f.read(min(1024 * 1024, remaining if limit is not None else 1024 * 1024))
+    read = 0
+    with open(path, "rb", buffering=0) as f:
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
             if not chunk:
                 break
             h.update(chunk)
-            remaining -= len(chunk)
-            if bar is not None:
-                bar.update(len(chunk))
-    return h.hexdigest()
+            read += len(chunk)
+    return h.hexdigest(), read
+
+
+def sample_hash(path, size, sample=_SAMPLE):
+    """Fast signature: SHA-1 of size + head/middle/tail samples.
+
+    For files up to 3 samples long the whole file is read (so it's exact);
+    larger files read only 3*sample bytes regardless of size. Photos and videos
+    differ throughout, so a head/middle/tail match means identical in practice.
+    Returns (digest, bytes_read).
+    """
+    h = hashlib.sha1()
+    h.update(str(size).encode())
+    with open(path, "rb", buffering=0) as f:
+        if size <= sample * 3:
+            data = f.read()
+            h.update(data)
+            return h.hexdigest(), len(data)
+        h.update(f.read(sample))
+        f.seek(size // 2)
+        h.update(f.read(sample))
+        f.seek(-sample, os.SEEK_END)
+        h.update(f.read(sample))
+    return h.hexdigest(), sample * 3
 
 
 def gather(folder):
@@ -121,38 +142,42 @@ def keeper(paths):
     return min(paths, key=rank)
 
 
-def find_duplicates(folder):
-    """Return list of (keep_path, [dup_paths]) for byte-identical groups."""
+def find_duplicates(folder, full=False):
+    """Return list of (keep_path, [dup_paths]) for identical-content groups.
+
+    Files are first bucketed by size (free, from stat), so only files that share
+    a size are ever read. Each such file is reduced to a signature — a fast
+    head/middle/tail sample by default, or a whole-file hash with full=True.
+    """
     by_size = gather(folder)
     candidates = {s: ps for s, ps in by_size.items() if len(ps) > 1}
+
+    def to_read(size):
+        return size if (full or size <= _SAMPLE * 3) else _SAMPLE * 3
+
+    total_bytes = sum(to_read(s) * len(ps) for s, ps in candidates.items())
     total_files = sum(len(ps) for ps in candidates.values())
-    total_bytes = sum(s * len(ps) for s, ps in candidates.items())
     print(f"Scanned folder: {sum(len(v) for v in by_size.values())} files; "
-          f"{total_files} share a size and will be hashed "
-          f"({human(total_bytes)} to read).")
+          f"{total_files} share a size ({human(total_bytes)} to read, "
+          f"{'full hash' if full else 'sampled'}).")
 
     bar = make_bar(total_bytes, "  Hashing")
     groups = []
     for size, paths in candidates.items():
-        # Prefilter by a quick hash so we full-read only likely matches.
-        quick = defaultdict(list)
+        buckets = defaultdict(list)
         for p in paths:
-            quick[file_hash(p, limit=_QUICK_BYTES)].append(p)
-            bar.update(min(size, _QUICK_BYTES))
-        for qpaths in quick.values():
-            if len(qpaths) < 2:
-                # Skip the rest of these bytes on the bar (won't be full-hashed).
-                bar.update(max(0, (size - min(size, _QUICK_BYTES)) * len(qpaths)))
+            try:
+                digest, read = full_hash(p) if full else sample_hash(p, size)
+            except OSError as e:
+                bar.write(f"  skipped {p}: {e}")
+                bar.update(to_read(size))
                 continue
-            full = defaultdict(list)
-            for p in qpaths:
-                full[file_hash(p, bar=bar if size > _QUICK_BYTES else None)].append(p)
-                if size <= _QUICK_BYTES:
-                    pass  # already fully read by the quick pass
-            for fpaths in full.values():
-                if len(fpaths) > 1:
-                    k = keeper(fpaths)
-                    groups.append((k, [p for p in fpaths if p != k]))
+            buckets[digest].append(p)
+            bar.update(read)
+        for members in buckets.values():
+            if len(members) > 1:
+                k = keeper(members)
+                groups.append((k, [p for p in members if p != k]))
     bar.close()
     return groups
 
@@ -166,6 +191,9 @@ def main():
                     help="With --apply, delete outright instead of moving to trash.")
     ap.add_argument("--trash", default=None,
                     help="Trash folder for removed dupes (default: <folder>/_duplicates).")
+    ap.add_argument("--full", action="store_true",
+                    help="Hash whole files instead of head/middle/tail samples "
+                         "(slower, exact byte-for-byte certainty).")
     args = ap.parse_args()
 
     folder = os.path.abspath(args.folder)
@@ -173,7 +201,7 @@ def main():
         sys.exit(f"Not a folder: {folder}")
     trash = os.path.abspath(args.trash) if args.trash else os.path.join(folder, "_duplicates")
 
-    groups = find_duplicates(folder)
+    groups = find_duplicates(folder, full=args.full)
     dup_count = sum(len(d) for _, d in groups)
     freed = sum(os.path.getsize(d) for _, ds in groups for d in ds)
     print(f"\nFound {len(groups)} duplicate group(s): "

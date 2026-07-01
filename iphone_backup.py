@@ -219,6 +219,9 @@ def download(udid, target, jobs, bar):
     """
     staging = ".incoming"
     staging_abs = os.path.join(target, staging)
+    # Start clean: a leftover staging folder from an interrupted run could hold
+    # higher-numbered files than this chunk and throw off progress accounting.
+    shutil.rmtree(staging_abs, ignore_errors=True)
     os.makedirs(staging_abs, exist_ok=True)
 
     script = "".join(
@@ -239,7 +242,7 @@ def download(udid, target, jobs, bar):
             present = [int(n) for n in os.listdir(staging_abs) if n.isdigit()]
         except FileNotFoundError:
             present = []
-        hi = max(present) if present else -1
+        hi = min(max(present), len(jobs) - 1) if present else -1
         while counted < hi:
             bar.update(jobs[counted][3])
             counted += 1

@@ -82,6 +82,12 @@ python3 dedup.py "/Volumes/YourSSD/iPhoneBackup" --apply --delete # delete them 
 Safe by default (only reports). `--apply` moves duplicates into a `_duplicates/`
 trash folder you can review and delete when happy.
 
+**Speed.** It only reads files that share a size, and for each it hashes just a
+head/middle/tail **sample** rather than the whole file — so a 125 MB video is
+identified from ~768 KB, not 125 MB. This is reliable for photos/videos (they
+differ throughout). Add `--full` to hash entire files for exact byte-for-byte
+certainty (much slower on large libraries).
+
 ---
 
 ## Troubleshooting
