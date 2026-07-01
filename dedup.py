@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-dedup.py — find and remove byte-identical duplicate files in a folder.
+dedup.py — find and remove duplicate files in a folder.
 
-Two files are "duplicates" only if their contents are identical (same bytes).
-Files that merely share a name but differ in content — e.g. the iPhone's
-counter-wrap photos IMG_5059.MOV vs 'IMG_5059 1.MOV' when they are different
-videos — are NOT touched.
+Two files are treated as duplicates when they have the same size AND matching
+content. By default matching is judged from head/middle/tail content samples
+(fast, and reliable for photos/videos, which differ throughout); pass --full to
+require an exact byte-for-byte whole-file match. Files that merely share a name
+but differ in content — e.g. the iPhone's counter-wrap photos IMG_5059.MOV vs
+'IMG_5059 1.MOV' when they are different videos — are NOT touched.
 
 For each group of identical files, ONE canonical copy is kept and the rest are
 removed. The keeper is chosen by "cleanest name": no trailing ' 1'/' 2' suffix
@@ -25,6 +27,7 @@ import argparse
 import hashlib
 import os
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -95,42 +98,49 @@ def full_hash(path):
     return h.hexdigest(), read
 
 
-def sample_hash(path, size, sample=_SAMPLE):
-    """Fast signature: SHA-1 of size + head/middle/tail samples.
-
-    For files up to 3 samples long the whole file is read (so it's exact);
-    larger files read only 3*sample bytes regardless of size. Photos and videos
-    differ throughout, so a head/middle/tail match means identical in practice.
-    Returns (digest, bytes_read).
-    """
+def head_hash(path, sample=_SAMPLE):
+    """SHA-1 of the first `sample` bytes (one sequential read, no seek)."""
     h = hashlib.sha1()
-    h.update(str(size).encode())
     with open(path, "rb", buffering=0) as f:
-        if size <= sample * 3:
-            data = f.read()
-            h.update(data)
-            return h.hexdigest(), len(data)
-        h.update(f.read(sample))
+        data = f.read(sample)
+    h.update(data)
+    return h.hexdigest(), len(data)
+
+
+def midtail_hash(path, size, sample=_SAMPLE):
+    """SHA-1 of the middle + tail samples (used to confirm head matches)."""
+    h = hashlib.sha1()
+    with open(path, "rb", buffering=0) as f:
         f.seek(size // 2)
         h.update(f.read(sample))
         f.seek(-sample, os.SEEK_END)
         h.update(f.read(sample))
-    return h.hexdigest(), sample * 3
+    return h.hexdigest(), sample * 2
 
 
 def gather(folder):
-    """Return {size: [paths]} for regular files, skipping hidden/._ files."""
+    """Return {size: [paths]} for regular files, skipping hidden/._ files,
+    symlinks, and the _duplicates trash folder. Uses scandir so each entry is
+    stat'd once (not twice), which matters on slow external disks."""
     by_size = defaultdict(list)
-    for root, dirs, files in os.walk(folder):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "_duplicates"]
-        for name in files:
-            if name.startswith(".") or name.startswith("._"):
-                continue
-            p = os.path.join(root, name)
-            try:
-                by_size[os.path.getsize(p)].append(p)
-            except OSError:
-                pass
+    stack = [folder]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.name.startswith(".") or e.name.startswith("._"):
+                        continue
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name != "_duplicates":
+                                stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            by_size[e.stat(follow_symlinks=False).st_size].append(e.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return by_size
 
 
@@ -142,12 +152,20 @@ def keeper(paths):
     return min(paths, key=rank)
 
 
+def _emit(members, size, groups):
+    if len(members) > 1:
+        k = keeper(members)
+        groups.append((k, [p for p in members if p != k], size))
+
+
 def find_duplicates(folder, full=False):
     """Return list of (keep_path, [dup_paths]) for identical-content groups.
 
     Files are first bucketed by size (free, from stat), so only files that share
-    a size are ever read. Each such file is reduced to a signature — a fast
-    head/middle/tail sample by default, or a whole-file hash with full=True.
+    a size are ever read. Then, to minimise seeks on spinning disks, large files
+    are prefiltered by a single sequential read of their HEAD; only files whose
+    head (and size) already match pay for the extra middle/tail seeks. Small
+    files (and --full) are hashed whole in one read.
     """
     by_size = gather(folder)
     candidates = {s: ps for s, ps in by_size.items() if len(ps) > 1}
@@ -157,27 +175,58 @@ def find_duplicates(folder, full=False):
 
     total_bytes = sum(to_read(s) * len(ps) for s, ps in candidates.items())
     total_files = sum(len(ps) for ps in candidates.values())
-    print(f"Scanned folder: {sum(len(v) for v in by_size.values())} files; "
-          f"{total_files} share a size ({human(total_bytes)} to read, "
-          f"{'full hash' if full else 'sampled'}).")
+    all_files = sum(len(v) for v in by_size.values())
+    unique = all_files - total_files
+    print(f"Scanned {all_files} files: {unique} have a unique size (skipped "
+          f"without reading); {total_files} share a size and get checked "
+          f"({human(total_bytes)} max to read, {'full hash' if full else 'sampled'}).")
 
     bar = make_bar(total_bytes, "  Hashing")
     groups = []
     for size, paths in candidates.items():
-        buckets = defaultdict(list)
+        if full or size <= _SAMPLE * 3:
+            # One sequential read of the whole (small) file — exact.
+            buckets = defaultdict(list)
+            for p in paths:
+                try:
+                    digest, read = full_hash(p)
+                except OSError as e:
+                    bar.write(f"  skipped {p}: {e}")
+                    bar.update(to_read(size))
+                    continue
+                buckets[digest].append(p)
+                bar.update(read)
+            for members in buckets.values():
+                _emit(members, size, groups)
+            continue
+
+        # Large files: prefilter by head (1 seek), confirm with mid+tail.
+        head = defaultdict(list)
         for p in paths:
             try:
-                digest, read = full_hash(p) if full else sample_hash(p, size)
+                digest, read = head_hash(p)
             except OSError as e:
                 bar.write(f"  skipped {p}: {e}")
                 bar.update(to_read(size))
                 continue
-            buckets[digest].append(p)
+            head[digest].append(p)
             bar.update(read)
-        for members in buckets.values():
-            if len(members) > 1:
-                k = keeper(members)
-                groups.append((k, [p for p in members if p != k]))
+        for hpaths in head.values():
+            if len(hpaths) < 2:
+                bar.update(_SAMPLE * 2 * len(hpaths))   # skipped mid+tail reads
+                continue
+            confirmed = defaultdict(list)
+            for p in hpaths:
+                try:
+                    digest, read = midtail_hash(p, size)
+                except OSError as e:
+                    bar.write(f"  skipped {p}: {e}")
+                    bar.update(_SAMPLE * 2)
+                    continue
+                confirmed[digest].append(p)
+                bar.update(read)
+            for members in confirmed.values():
+                _emit(members, size, groups)
     bar.close()
     return groups
 
@@ -202,14 +251,14 @@ def main():
     trash = os.path.abspath(args.trash) if args.trash else os.path.join(folder, "_duplicates")
 
     groups = find_duplicates(folder, full=args.full)
-    dup_count = sum(len(d) for _, d in groups)
-    freed = sum(os.path.getsize(d) for _, ds in groups for d in ds)
+    dup_count = sum(len(d) for _, d, _ in groups)
+    freed = sum(size * len(d) for _, d, size in groups)
     print(f"\nFound {len(groups)} duplicate group(s): "
           f"{dup_count} redundant file(s), {human(freed)} recoverable.\n")
 
     if not groups:
         return
-    for keep, dups in groups[:15]:
+    for keep, dups, _ in groups[:15]:
         print(f"  keep {os.path.basename(keep)}")
         for d in dups:
             print(f"    dup  {os.path.relpath(d, folder)}")
@@ -224,7 +273,7 @@ def main():
     action = "Deleting" if args.delete else f"Moving to {trash}"
     print(f"\n{action} {dup_count} duplicate(s)...")
     removed = errors = 0
-    for _, dups in groups:
+    for _, dups, _ in groups:
         for d in dups:
             try:
                 if args.delete:
@@ -236,7 +285,10 @@ def main():
                     if os.path.exists(dest):
                         base, ext = os.path.splitext(dest)
                         dest = f"{base}_{int(time.time()*1000)}{ext}"
-                    os.replace(d, dest)
+                    try:
+                        os.replace(d, dest)          # fast path (same filesystem)
+                    except OSError:
+                        shutil.move(d, dest)          # fallback (cross-device trash)
                 removed += 1
             except OSError as e:
                 print(f"  error on {d}: {e}")
