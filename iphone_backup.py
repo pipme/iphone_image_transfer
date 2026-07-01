@@ -129,38 +129,72 @@ def list_dcim(udid):
     return out
 
 
-def scan_target(target):
-    """Return {filename: size} for regular files already in the target root."""
-    existing = {}
-    if os.path.isdir(target):
-        with os.scandir(target) as it:
-            for e in it:
-                if e.is_file() and not e.name.startswith("._"):
-                    existing[e.name] = e.stat().st_size
-    return existing
-
-
-def resolve_name(name, size, existing, used):
-    """Pick a flat target filename for a device file, never overwriting.
-
-    Returns (target_name, already_present). Tries the bare name, then
-    'stem 1.ext', 'stem 2.ext', ... skipping names taken this run (`used`) or
-    occupied on disk by a different-sized file (`existing`). A name already on
-    disk with the SAME size means the file is already backed up.
-    """
+def base_stem(name):
+    """('IMG_5059 2.MOV') -> ('IMG_5059', '.MOV'); strips a trailing ' N'."""
     stem, ext = os.path.splitext(name)
+    return re.sub(r" \d+$", "", stem), ext
+
+
+def scan_target(target):
+    """Index the files at the target's TOP LEVEL only (the flat backup root).
+
+    We deliberately do NOT descend into subfolders such as the _duplicates/
+    trash: that folder is temporary and meant to be deleted, so whether a photo
+    counts as "already backed up" must be decided purely from what is actually
+    kept at the root. (dedup.py renumbers survivors so a stem's suffixes stay
+    contiguous, which keeps this check exact.)
+
+    Returns (sizes_by_stem, top_names, count):
+      sizes_by_stem : {(base_stem, ext): {size, ...}}  over root files
+      top_names     : {filename}  at the root (for placing new files)
+      count         : total root files seen
+    """
+    sizes_by_stem = {}
+    top_names = set()
+    count = 0
+    try:
+        entries = list(os.scandir(target))
+    except OSError:
+        return sizes_by_stem, top_names, count
+    for e in entries:
+        if e.name.startswith("._"):
+            continue
+        try:
+            if not e.is_file(follow_symlinks=False):
+                continue
+            size = e.stat(follow_symlinks=False).st_size
+        except OSError:
+            continue
+        sizes_by_stem.setdefault(base_stem(e.name), set()).add(size)
+        top_names.add(e.name)
+        count += 1
+    return sizes_by_stem, top_names, count
+
+
+def resolve_name(name, size, sizes_by_stem, top_names, used):
+    """Decide whether a device photo is already backed up, and if not, pick a
+    flat target filename for it.
+
+    A photo is considered already present if ANY file sharing its base name
+    (bare name or 'name 1', 'name 2', ...) at the target ROOT has the same size.
+    So copying 'IMG_123 1.MOV' checks IMG_123.MOV, 'IMG_123 1.MOV',
+    'IMG_123 2.MOV', ... at the root and skips if one matches its size.
+    Otherwise it's placed at the next free top-level suffix. Returns
+    (target_name_or_None, already_present).
+    """
+    key = base_stem(name)
+    if size in sizes_by_stem.get(key, ()):
+        return None, True
+
+    stem, ext = key
     i = 0
     while True:
         cand = name if i == 0 else f"{stem} {i}{ext}"
         i += 1
-        if cand in used:
+        if cand in used or cand in top_names:
             continue
-        if cand in existing:
-            if existing[cand] == size:
-                used[cand] = size
-                return cand, True
-            continue
-        used[cand] = size
+        used.add(cand)
+        sizes_by_stem.setdefault(key, set()).add(size)  # so a later run/dup skips it
         return cand, False
 
 
@@ -292,14 +326,14 @@ def main():
     device = list_dcim(udid)
     print(f"Found {len(device)} files on device.")
 
-    existing = scan_target(target)
-    print(f"Target already holds {len(existing)} files.\n")
+    sizes_by_stem, top_names, tcount = scan_target(target)
+    print(f"Target already holds {tcount} files.\n")
 
-    used = {}
+    used = set()
     jobs = []          # files to download this run
     skipped = 0
     for folder, devname, size, mtime in device:
-        target_name, present = resolve_name(devname, size, existing, used)
+        target_name, present = resolve_name(devname, size, sizes_by_stem, top_names, used)
         if present:
             skipped += 1
         else:

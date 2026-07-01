@@ -53,9 +53,14 @@ What you get:
 - **Flat folder** — all photos/videos directly in the target, no subfolders.
 - **Original dates** — each file's modified-time is set to when the photo was
   taken.
-- **No duplicates added** — a file already present (same name + size) is
-  skipped. When the iPhone's `IMG_####` counter wraps and two *different* photos
-  share a name, the later one gets a ` 1`/` 2` suffix so nothing is lost.
+- **No duplicates added** — a photo is treated as already backed up if *any*
+  file sharing its base name (`IMG_1234`, `IMG_1234 1`, `IMG_1234 2`, …) at the
+  target **root** has the same size. (It looks only at the root, not the
+  temporary `_duplicates/` trash, since that folder is meant to be deleted.)
+  When the iPhone's `IMG_####` counter wraps and two *different* photos share a
+  name, they have different sizes and each is kept (the later one gets a ` 1`/
+  ` 2` suffix). Run `dedup.py` after a backup so it can renumber survivors and
+  keep these suffixes contiguous — that keeps this check exact.
 - **Safe & resumable** — never deletes or overwrites; if interrupted, just run
   it again to continue.
 
@@ -80,7 +85,11 @@ python3 dedup.py "/Volumes/YourSSD/iPhoneBackup" --apply --delete # delete them 
 ```
 
 Safe by default (only reports). `--apply` moves duplicates into a `_duplicates/`
-trash folder you can review and delete when happy.
+trash folder you can review and delete when happy. After removing duplicates it
+also **renumbers** the survivors so each name's ` N` suffixes are contiguous
+(`IMG_123`, `IMG_123 1`, `IMG_123 2`, … — no gaps); pass `--no-renumber` to skip
+that. Keeping suffixes contiguous is what lets the backup's root-only check stay
+exact, so you can safely delete `_duplicates/` afterwards.
 
 **Speed.** It only reads files that share a size, and for each it hashes just a
 head/middle/tail **sample** rather than the whole file — so a 125 MB video is
