@@ -91,6 +91,19 @@ also **renumbers** the survivors so each name's ` N` suffixes are contiguous
 that. Keeping suffixes contiguous is what lets the backup's root-only check stay
 exact, so you can safely delete `_duplicates/` afterwards.
 
+**Tombstones.** The phone itself often stores identical content under two
+different names — iOS keeps an `IMG_O####.AAE` "Original" sidecar next to
+`IMG_####.AAE` for edited photos, AirDrop saves get random names like
+`GRCD5290.JPG`, and camera imports keep their `DSC_####.JPG` names. The backup
+copies every name; dedup removes the redundant copy — and without a record of
+that, the next backup would see the removed name as missing and re-copy it,
+forever. So `--apply` records every file it removes from the target root in
+`<target>/.dedup_tombstones` (base name, extension, size), and
+`iphone_backup.py` treats tombstoned entries as already backed up. Deleting the
+manifest is safe but causes a one-time re-copy/re-dedup cycle. If you have a
+`_duplicates/` folder from runs that predate tombstones, backfill it once with
+`--seed-tombstones`.
+
 **Speed.** It only reads files that share a size, and for each it hashes just a
 head/middle/tail **sample** rather than the whole file — so a 125 MB video is
 identified from ~768 KB, not 125 MB. This is reliable for photos/videos (they

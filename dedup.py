@@ -38,7 +38,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 _SUFFIX_RE = re.compile(r" \d+$")            # trailing " 1", " 12", ...
 _DEVICE_STEM_RE = re.compile(r"^IMG_\d+$")    # iPhone's own naming, pre-suffix
+_TRASH_TS_RE = re.compile(r"_\d{13}$")        # ms suffix trash adds on collision
 _SAMPLE = 256 * 1024                          # bytes sampled per region (head/mid/tail)
+TOMBSTONES_NAME = ".dedup_tombstones"
 
 
 def human(n):
@@ -154,6 +156,74 @@ def suffix_index(name):
     stem = os.path.splitext(name)[0]
     m = _SUFFIX_RE.search(stem)
     return int(m.group().strip()) if m else 0
+
+
+def base_stem(name):
+    """('IMG_5059 2.MOV') -> ('IMG_5059', '.MOV'); strips a trailing ' N'.
+    Must mirror iphone_backup.py's base_stem so tombstone keys match."""
+    stem, ext = os.path.splitext(name)
+    return _SUFFIX_RE.sub("", stem), ext
+
+
+def load_tombstones(folder):
+    """Read <folder>/.dedup_tombstones into a set of (stem, ext, size) keys.
+
+    The tombstone manifest records files dedup removed from the target ROOT
+    so iphone_backup.py can treat them as already backed up: the phone often
+    stores identical content under two names (IMG_0007.AAE vs IMG_O0007.AAE,
+    AirDrop names, ...), and without this record the backup would re-copy
+    whichever name dedup removed, forever.
+    """
+    keys = set()
+    try:
+        with open(os.path.join(folder, TOMBSTONES_NAME), encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3:
+                    try:
+                        keys.add((parts[0], parts[1], int(parts[2])))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return keys
+
+
+def append_tombstones(folder, records):
+    """Append (name, size) records to the manifest, skipping keys already
+    present. TSV: stem<TAB>ext<TAB>size<TAB>original_name (name is debug-only;
+    filenames may contain spaces but never tabs). Returns count written."""
+    existing = load_tombstones(folder)
+    lines = []
+    for name, size in records:
+        stem, ext = base_stem(name)
+        if (stem, ext, size) not in existing:
+            existing.add((stem, ext, size))
+            lines.append(f"{stem}\t{ext}\t{size}\t{name}\n")
+    if lines:
+        with open(os.path.join(folder, TOMBSTONES_NAME), "a", encoding="utf-8") as f:
+            f.writelines(lines)
+    return len(lines)
+
+
+def seed_tombstones(folder, trash):
+    """Backfill the manifest from files already sitting in the trash folder
+    (removed by earlier runs that predate tombstones). Strips the trash's
+    '_<13-digit ms>' collision suffix so keys match the original names."""
+    records = []
+    for root, _, files in os.walk(trash):
+        for fn in files:
+            if fn.startswith("."):
+                continue
+            stem, ext = os.path.splitext(fn)
+            stem = _TRASH_TS_RE.sub("", stem)
+            try:
+                size = os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                continue
+            records.append((stem + ext, size))
+    n = append_tombstones(folder, records)
+    print(f"Seeded {n} tombstone(s) from {len(records)} file(s) in {trash}.")
 
 
 def top_level_files(folder):
@@ -364,12 +434,19 @@ def main():
                     help="Don't make ' N' suffixes contiguous after removing "
                          "duplicates (default: renumber survivors so a stem's "
                          "files are name, 'name 1', 'name 2', ... with no gaps).")
+    ap.add_argument("--seed-tombstones", action="store_true",
+                    help="Backfill the tombstone manifest from files already "
+                         "in the trash folder, then exit (no scan).")
     args = ap.parse_args()
 
     folder = os.path.abspath(args.folder)
     if not os.path.isdir(folder):
         sys.exit(f"Not a folder: {folder}")
     trash = os.path.abspath(args.trash) if args.trash else os.path.join(folder, "_duplicates")
+
+    if args.seed_tombstones:
+        seed_tombstones(folder, trash)
+        return
 
     groups = find_duplicates(folder, full=args.full, workers=args.workers)
     dup_count = sum(len(d) for _, d, _ in groups)
@@ -409,10 +486,11 @@ def main():
         return
 
     removed = errors = 0
+    tombstone_records = []                # (name, size) of root files removed
     if groups:
         action = "Deleting" if args.delete else f"Moving to {trash}"
         print(f"\n{action} {dup_count} duplicate(s)...")
-        for _, dups, _ in groups:
+        for _, dups, size in groups:
             for d in dups:
                 try:
                     if args.delete:
@@ -429,11 +507,17 @@ def main():
                         except OSError:
                             shutil.move(d, dest)      # fallback (cross-device trash)
                     removed += 1
+                    if os.path.dirname(os.path.abspath(d)) == folder:
+                        tombstone_records.append((os.path.basename(d), size))
                 except OSError as e:
                     print(f"  error on {d}: {e}")
                     errors += 1
         print(f"Done. removed: {removed}   freed: {human(freed)}", end="")
         print(f"   errors: {errors}" if errors else "")
+        n = append_tombstones(folder, tombstone_records)
+        if n:
+            print(f"Recorded {n} tombstone(s) in {TOMBSTONES_NAME} so the "
+                  "backup won't re-copy these names.")
         if not args.delete:
             print(f"Duplicates are in {trash} — delete that folder when you're happy.")
 

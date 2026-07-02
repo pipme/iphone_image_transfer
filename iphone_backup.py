@@ -47,6 +47,7 @@ _LS_RE = re.compile(
 )
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _PROMPT_RE = re.compile(r"^afc:[^>]*>\s*")
+TOMBSTONES_NAME = ".dedup_tombstones"        # written by dedup.py --apply
 
 
 def run(cmd, **kw):
@@ -135,6 +136,31 @@ def base_stem(name):
     return re.sub(r" \d+$", "", stem), ext
 
 
+def load_tombstones(target):
+    """Read the tombstone manifest dedup.py maintains at the target root.
+
+    Returns a frozenset of (stem, ext, size) keys for files dedup removed as
+    byte-identical duplicates. The phone often stores the same content under
+    two names (e.g. IMG_0007.AAE and iOS's 'Original' sidecar IMG_O0007.AAE,
+    AirDrop names, camera imports); once dedup removes one, the name looks
+    missing here and would be re-copied forever — unless it's tombstoned.
+    Missing manifest just means an empty set (pre-tombstone behavior).
+    """
+    keys = set()
+    try:
+        with open(os.path.join(target, TOMBSTONES_NAME), encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3:
+                    try:
+                        keys.add((parts[0], parts[1], int(parts[2])))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return frozenset(keys)
+
+
 def scan_target(target):
     """Index the files at the target's TOP LEVEL only (the flat backup root).
 
@@ -157,7 +183,7 @@ def scan_target(target):
     except OSError:
         return sizes_by_stem, top_names, count
     for e in entries:
-        if e.name.startswith("._"):
+        if e.name.startswith("."):        # ._ sidecars, .dedup_tombstones, ...
             continue
         try:
             if not e.is_file(follow_symlinks=False):
@@ -171,19 +197,19 @@ def scan_target(target):
     return sizes_by_stem, top_names, count
 
 
-def resolve_name(name, size, sizes_by_stem, top_names, used):
+def resolve_name(name, size, sizes_by_stem, top_names, used, tombstones=frozenset()):
     """Decide whether a device photo is already backed up, and if not, pick a
     flat target filename for it.
 
     A photo is considered already present if ANY file sharing its base name
-    (bare name or 'name 1', 'name 2', ...) at the target ROOT has the same size.
-    So copying 'IMG_123 1.MOV' checks IMG_123.MOV, 'IMG_123 1.MOV',
-    'IMG_123 2.MOV', ... at the root and skips if one matches its size.
-    Otherwise it's placed at the next free top-level suffix. Returns
-    (target_name_or_None, already_present).
+    (bare name or 'name 1', 'name 2', ...) at the target ROOT has the same
+    size, OR if that (base name, size) was recorded as a dedup tombstone —
+    i.e. a copy of it was intentionally removed as a byte-identical duplicate
+    and must not be re-copied. Otherwise it's placed at the next free
+    top-level suffix. Returns (target_name_or_None, already_present).
     """
     key = base_stem(name)
-    if size in sizes_by_stem.get(key, ()):
+    if size in sizes_by_stem.get(key, ()) or key + (size,) in tombstones:
         return None, True
 
     stem, ext = key
@@ -327,13 +353,18 @@ def main():
     print(f"Found {len(device)} files on device.")
 
     sizes_by_stem, top_names, tcount = scan_target(target)
-    print(f"Target already holds {tcount} files.\n")
+    print(f"Target already holds {tcount} files.")
+    tombstones = load_tombstones(target)
+    if tombstones:
+        print(f"Loaded {len(tombstones)} dedup tombstone(s).")
+    print()
 
     used = set()
     jobs = []          # files to download this run
     skipped = 0
     for folder, devname, size, mtime in device:
-        target_name, present = resolve_name(devname, size, sizes_by_stem, top_names, used)
+        target_name, present = resolve_name(devname, size, sizes_by_stem,
+                                            top_names, used, tombstones)
         if present:
             skipped += 1
         else:
